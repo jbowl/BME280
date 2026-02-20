@@ -1,3 +1,4 @@
+#include <gpiod.h>
 /*
   Comple：make
   Run: ./bme280
@@ -10,8 +11,12 @@
 #include "bme280.h"
 #include <stdio.h>
 #include <unistd.h>
-#include <wiringPi.h>
-#include <wiringPiSPI.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <linux/spi/spidev.h>
+#include <stdint.h>
+#include <string.h>
+#include <stdlib.h>
 
 //Raspberry 3B+ platform's default SPI channel
 #define channel 0  
@@ -21,7 +26,7 @@
 
 //This definition you use I2C or SPI to drive the bme280
 //When it is 1 means use I2C interface, When it is 0,use SPI interface
-#define USEIIC 1
+#define USEIIC 0
 
 
 #if(USEIIC)
@@ -60,14 +65,25 @@ int8_t user_i2c_write(uint8_t id, uint8_t reg_addr, uint8_t *data, uint16_t len)
 }
 #else
 
+
+#define CS_GPIO 27
+#define SPI_DEV "/dev/spidev0.0"
+static int spi_fd = -1;
+static struct gpiod_chip *chip = NULL;
+static struct gpiod_line *cs_line = NULL;
+
 void SPI_BME280_CS_High(void)
 {
-	digitalWrite(27,1);
+  if (cs_line) {
+    gpiod_line_set_value(cs_line, 1);
+  }
 }
 
 void SPI_BME280_CS_Low(void)
 {
-	digitalWrite(27,0);
+  if (cs_line) {
+    gpiod_line_set_value(cs_line, 0);
+  }
 }
 
 void user_delay_ms(uint32_t period)
@@ -77,50 +93,49 @@ void user_delay_ms(uint32_t period)
 
 int8_t user_spi_read(uint8_t dev_id, uint8_t reg_addr, uint8_t *reg_data, uint16_t len)
 {
-	int8_t rslt = 0;
-	
-	SPI_BME280_CS_High();
-	SPI_BME280_CS_Low();
-	
-	wiringPiSPIDataRW(channel,&reg_addr,1);
+  int8_t rslt = 0;
+  struct spi_ioc_transfer tr[2];
+  uint8_t tx[1];
+  tx[0] = reg_addr | 0x80; // set MSB for read
+  memset(tr, 0, sizeof(tr));
 
-	#if(USESPISINGLEREADWRITE)
-    for(int i=0; i < len ; i++)
-	{
-	  wiringPiSPIDataRW(channel,reg_data,1);
-	  reg_data++;
-	}
-	#else
-	wiringPiSPIDataRW(channel,reg_data,len);
-	#endif
-	
-	SPI_BME280_CS_High();
-	
-	return rslt;
+  SPI_BME280_CS_Low();
+
+  tr[0].tx_buf = (unsigned long)tx;
+  tr[0].rx_buf = 0;
+  tr[0].len = 1;
+  tr[0].speed_hz = 2000000;
+  tr[0].bits_per_word = 8;
+
+  tr[1].tx_buf = 0;
+  tr[1].rx_buf = (unsigned long)reg_data;
+  tr[1].len = len;
+  tr[1].speed_hz = 2000000;
+  tr[1].bits_per_word = 8;
+
+  if (ioctl(spi_fd, SPI_IOC_MESSAGE(2), tr) < 1) {
+    rslt = -1;
+  }
+
+  SPI_BME280_CS_High();
+  return rslt;
 }
 
 int8_t user_spi_write(uint8_t dev_id, uint8_t reg_addr, uint8_t *reg_data, uint16_t len)
 {
-	int8_t rslt = 0;
+    int8_t rslt = 0;
+    uint8_t *tx = malloc(len + 1);
+    if (!tx) return -1;
+    tx[0] = reg_addr & 0x7F; // clear MSB for write
+    memcpy(&tx[1], reg_data, len);
 
-	SPI_BME280_CS_High();
-	SPI_BME280_CS_Low();
-
-	wiringPiSPIDataRW(channel,&reg_addr,1);
-	
-	#if(USESPISINGLEREADWRITE)
-	for(int i = 0; i < len ; i++)
-	{
-		wiringPiSPIDataRW(channel,reg_data,1);
-		reg_data++;
-	}
-	#else
-	wiringPiSPIDataRW(channel,reg_data,len);
-	#endif
-	
-	SPI_BME280_CS_High();
-	
-	return rslt;
+    SPI_BME280_CS_Low();
+    if (write(spi_fd, tx, len + 1) != len + 1) {
+        rslt = -1;
+    }
+    SPI_BME280_CS_High();
+    free(tx);
+    return rslt;
 }
 #endif
 
@@ -223,16 +238,38 @@ int main(int argc, char* argv[])
 #else
 int main(int argc, char* argv[])
 {
-  if(wiringPiSetup() < 0)
-  {
+  // Open GPIO chip (usually "gpiochip0")
+  chip = gpiod_chip_open_by_name("gpiochip0");
+  if (!chip) {
+    perror("gpiod_chip_open_by_name");
     return 1;
   }
-  
-  pinMode (27,OUTPUT) ;
-  
-  SPI_BME280_CS_Low();//once pull down means use SPI Interface
-  
-  wiringPiSPISetup(channel,2000000);
+  cs_line = gpiod_chip_get_line(chip, CS_GPIO);
+  if (!cs_line) {
+    perror("gpiod_chip_get_line");
+    gpiod_chip_close(chip);
+    return 1;
+  }
+  if (gpiod_line_request_output(cs_line, "bme280_cs", 1) < 0) {
+    perror("gpiod_line_request_output");
+    gpiod_chip_close(chip);
+    return 1;
+  }
+
+  // Open SPI device
+  spi_fd = open(SPI_DEV, O_RDWR);
+  if (spi_fd < 0) {
+    perror("SPI device open");
+    gpiod_line_release(cs_line);
+    gpiod_chip_close(chip);
+    return 1;
+  }
+  uint8_t mode = 0;
+  uint32_t speed = 2000000;
+  ioctl(spi_fd, SPI_IOC_WR_MODE, &mode);
+  ioctl(spi_fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed);
+
+  SPI_BME280_CS_High(); // Deselect by default
 
   struct bme280_dev dev;
   int8_t rslt = BME280_OK;
@@ -247,5 +284,10 @@ int main(int argc, char* argv[])
   printf("\r\n BME280 Init Result is:%d \r\n",rslt);
   //stream_sensor_data_forced_mode(&dev);
   stream_sensor_data_normal_mode(&dev);
+
+  close(spi_fd);
+  gpiod_line_release(cs_line);
+  gpiod_chip_close(chip);
+  return 0;
 }
 #endif
