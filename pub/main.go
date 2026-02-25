@@ -13,7 +13,6 @@ import (
 	"github.com/jbowl/bme280"
 
 	"github.com/coreos/go-systemd/v22/daemon"
-	"github.com/pebbe/zmq4"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog"
@@ -39,10 +38,10 @@ func init() {
 	prometheus.MustRegister(tempGauge, pressGauge, humGauge)
 }
 
-func startMetricsServer() {
+func startMetricsServer(addr string) {
 	http.Handle("/metrics", promhttp.Handler())
 	go func() {
-		if err := http.ListenAndServe(":9100", nil); err != nil {
+		if err := http.ListenAndServe(addr, nil); err != nil {
 			log.Error().Err(err).Msg("metrics server failed")
 		}
 	}()
@@ -51,10 +50,14 @@ func startMetricsServer() {
 func main() {
 	zerolog.TimeFieldFormat = time.RFC3339Nano
 
+	cfg, err := LoadConfig("config.yaml")
+	if err != nil {
+		log.Fatal().Err(err).Msg("load config failed")
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Handle SIGINT/SIGTERM for graceful shutdown.
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -62,8 +65,8 @@ func main() {
 		log.Info().Str("signal", s.String()).Msg("shutdown requested")
 		cancel()
 	}()
-	// Open SPI and sensor.
-	spiDev, err := bme280.OpenSpiDev("/dev/spidev0.0")
+
+	spiDev, err := bme280.OpenSpiDev(cfg.SPI.Device)
 	if err != nil {
 		log.Fatal().Err(err).Msg("open spidev failed")
 	}
@@ -74,24 +77,16 @@ func main() {
 		log.Fatal().Err(err).Msg("init bme280 failed")
 	}
 
-	// ZeroMQ PUB socket.
-	pub, err := zmq4.NewSocket(zmq4.PUB)
+	pub, err := NewPublisher(ctx, cfg)
 	if err != nil {
-		log.Fatal().Err(err).Msg("create PUB failed")
+		log.Fatal().Err(err).Msg("publisher init failed")
 	}
 	defer pub.Close()
 
-	// Bind locally; stunnel will expose TLS externally.
-	if err := pub.Bind("tcp://127.0.0.1:5555"); err != nil {
-		log.Fatal().Err(err).Msg("bind failed")
-	}
+	startMetricsServer(cfg.Metrics.Addr)
 
-	startMetricsServer()
-
-	// Notify systemd we're ready.
 	daemon.SdNotify(false, daemon.SdNotifyReady)
 
-	// Watchdog pings.
 	go func() {
 		t := time.NewTicker(5 * time.Second)
 		defer t.Stop()
@@ -105,9 +100,9 @@ func main() {
 		}
 	}()
 
-	log.Info().Msg("bme280 publisher started")
+	log.Info().Str("backend", cfg.Backend).Msg("bme280 publisher started")
 
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(cfg.Publish.Interval)
 	defer ticker.Stop()
 
 	for {
@@ -126,7 +121,6 @@ func main() {
 			pressGauge.Set(float64(p))
 			humGauge.Set(float64(h))
 
-			// 20-byte binary payload: ts(float64) + temp/press/hum(float32).
 			buf := make([]byte, 20)
 			ts := float64(time.Now().UnixNano()) / 1e9
 			binary.BigEndian.PutUint64(buf[0:], math.Float64bits(ts))
@@ -134,8 +128,8 @@ func main() {
 			binary.BigEndian.PutUint32(buf[12:], math.Float32bits(p))
 			binary.BigEndian.PutUint32(buf[16:], math.Float32bits(h))
 
-			if _, err := pub.SendBytes(buf, 0); err != nil {
-				log.Error().Err(err).Msg("send failed")
+			if err := pub.Publish(buf); err != nil {
+				log.Error().Err(err).Msg("publish failed")
 			} else {
 				log.Debug().
 					Float32("temp", t).
